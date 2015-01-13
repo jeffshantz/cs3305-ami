@@ -9,7 +9,8 @@ Building the AMI
 Spin up an Ubuntu EC2 instance and clone the repository:
 
 ```bash
-sudo apt-get install git-core
+sudo apt-get update
+sudo apt-get install git-core language-pack-en
 git clone git@github.com:jeffshantz/cs3305-ami.git
 cd cs3305-ami
 ```
