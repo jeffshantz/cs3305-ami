@@ -10,7 +10,8 @@ Spin up an Ubuntu EC2 instance and clone the repository:
 
 ```bash
 sudo apt-get update
-sudo apt-get install git-core language-pack-en
+sudo apt-get install git-core language-pack-en python-pip
+sudo pip install awscli
 git clone https://github.com/jeffshantz/cs3305-ami.git
 cd cs3305-ami
 ```
@@ -32,7 +33,7 @@ vim build-ami
 As it takes a moment for an IAM user policy to take effect, you should ensure that you can run a command like the following before running the `build-ami` script:
 
 ```bash
-AWS_DEFAULT_REGION=us-east-1 aws ec2 describe-instances
+AWS_CONFIG_FILE=`pwd`/aws.config AWS_DEFAULT_REGION=us-east-1 aws ec2 describe-instances
 ```
 
 Finally, build the AMI.
