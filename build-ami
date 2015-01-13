@@ -156,7 +156,7 @@ echo "postfix postfix/main_mailer_type select No configuration" | sudo -E chroot
 echo "postfix postfix/mailname string ${brand,,}" | sudo -E chroot $imagedir debconf-set-selections
 
 # Fix locales
-sudo -E chroot $imagedir apt-get install -y language-pack-en-base
+sudo -E chroot $imagedir apt-get install -y language-pack-en
 
 # Install software
 sudo -E chroot $imagedir    \
