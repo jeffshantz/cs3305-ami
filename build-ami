@@ -1,0 +1,406 @@
+#!/bin/bash -ex
+#
+# build-ami
+#
+# Build new AMI for CS 3305.
+#
+# This expects to run on an EC2 instance.
+#
+# Adapted by Jeff Shantz from
+# https://github.com/alestic/alestic-git/blob/master/bin/alestic-git-build-ami
+#
+
+# Defaults
+
+# Brand used in AMI name and description
+brand="CS3305"
+
+# Size of AMI file system
+size=8 # GB
+
+# Ubuntu release
+codename=trusty
+
+# AMI name timestamp
+now=$(date -u +%Y%m%d-%H%M)
+
+# User information
+markeruser=marker
+markerkey=cs3305-marker.pub
+
+rescueuser=rescue
+rescuekey=cs3305-rescue.pub
+rescuecfg=99_rescue.cfg
+
+# AMI configuration
+name="${brand,,}-server-ubuntu-$release-$codename-$arch2-$now"
+description="$brand AMI - Western University - Ubuntu $release ${codename^} $arch2 $now"
+
+# aws-cli credentials
+export AWS_CONFIG_FILE=`pwd`/aws.config
+
+if [[ ! -f "$AWS_CONFIG_FILE" ]]
+then
+  echo
+  echo "Please create the file aws.config in the current directory."
+  echo "See aws.config.example for more details."
+  echo
+  echo "To obtain your credentials, create an IAM user with full access to EC2."
+  echo "Download its access key ID and secret access key, and place them in"
+  echo "aws.config.  As it takes a moment for an IAM user policy to take effect,"
+  echo "you should ensure that you can run a command like 'AWS_DEFAULT_REGION=us-east-1 aws ec2 describe-instances'"
+  echo "before re-running this script."
+  echo
+  exit -1
+fi
+
+# Command line options
+while [ $# -gt 0 ]; do
+  case $1 in
+    --brand)       brand=$2;     shift 2 ;;
+    --size)        size=$2;      shift 2 ;;
+    --codename)    codename=$2;  shift 2 ;;
+    --now)         now=$2;       shift 2 ;;
+    *)             echo "$0: Unrecognized option: $1" >&2; exit 1;
+  esac
+done
+
+# Setup
+case $codename in
+  maverick)   release=10.10     ;;
+  natty)      release=11.04     ;;
+  oneiric)    release=11.10     ;;
+  precise)    release=12.04     ;;
+  quantal)    release=12.10     ;;
+  trusty)     release=14.04     ;;
+  *)          echo "$0: Unrecognized codename: $codename" >&2; exit 1;
+esac
+
+if [ $(uname -m) = 'x86_64' ]; then
+  arch=x86_64
+  arch2=amd64
+  ephemeraldev=/dev/sdb
+else
+  arch=i386
+  arch2=i386
+  ephemeraldev=/dev/sda2
+fi
+
+imagename=$codename-server-cloudimg-$arch2
+imageurl=http://cloud-images.ubuntu.com/$codename/current/$imagename.tar.gz
+amisurl=http://cloud-images.ubuntu.com/query/$codename/server/released.current.txt
+zoneurl=http://169.254.169.254/latest/meta-data/placement/availability-zone
+
+# Sometimes, 169.254.169.254 does not resolve right away.
+# Loop to give it some time.
+while zone=$(wget -qO- $zoneurl);
+      test "$zone" = ""
+do
+  sleep 30
+done; echo " $zone"
+
+region=$(echo $zone | perl -pe 's/.$//')
+akiid=$(wget -qO- $amisurl | egrep "ebs.$arch2.$region.*paravirtual" | cut -f9)
+#ariid=$(wget -qO- $amisurl | egrep "ebs.$arch2.$region.*paravirtual" | cut -f10)
+
+# Set the default region for aws cli to our current region
+export AWS_DEFAULT_REGION=$region
+
+# Update and install Ubuntu packages
+export DEBIAN_FRONTEND=noninteractive
+sudo perl -pi -e 's/^# *(deb .*multiverse)$/$1/' /etc/apt/sources.list
+sudo apt-get update
+sudo -E apt-get upgrade -y
+sudo apt-get install -y python-pip
+sudo pip install awscli
+
+# Download base Ubuntu server image built by Canonical
+image=/mnt/$imagename.img
+imagedir=/mnt/$codename-cloudimg-$arch2
+wget -qO- $imageurl | sudo tar xzf - -C /mnt
+sudo mkdir -p $imagedir
+
+# Resize image (add 1 GB for CS 3305 packages)
+sudo sh -c "dd if=/dev/zero bs=1M count=1024 >> $image"
+sudo e2fsck -f $image
+sudo resize2fs $image
+sudo mount -o loop $image $imagedir
+
+# Allow network access from chroot environment
+sudo mkdir -p $imagedir/run/resolvconf
+sudo cp /etc/resolv.conf $imagedir/run/resolvconf/resolv.conf
+#sudo cp /etc/resolv.conf $imagedir/etc/resolvconf/resolv.conf.d/tail
+
+# We used XFS for the target root file system
+#sudo perl -pi -e 's%(\t/\t)ext4(\t)%${1}xfs${2}%' $imagedir/etc/fstab
+
+# Upgrade and install packages on the target file system
+sudo chroot $imagedir mount -t proc none /proc
+#sudo chroot $imagedir mount -t devpts none /dev/pts
+cat <<EOF | sudo tee $imagedir/usr/sbin/policy-rc.d > /dev/null
+#!/bin/sh
+exit 101
+EOF
+sudo chmod 755 $imagedir/usr/sbin/policy-rc.d
+DEBIAN_FRONTEND=noninteractive
+sudo perl -pi -e 's/^# *(deb .*multiverse)$/$1/' \
+  $imagedir/etc/apt/sources.list                 \
+  $imagedir/etc/cloud/templates/sources.list.ubuntu.tmpl
+#sudo chroot $imagedir add-apt-repository ppa:alestic
+sudo chroot $imagedir apt-get update
+sudo -E chroot $imagedir apt-get dist-upgrade -y
+
+#### BEGIN cs3305-setup
+
+echo "postfix postfix/main_mailer_type select No configuration" | sudo -E chroot $imagedir debconf-set-selections
+echo "postfix postfix/mailname string ${brand,,}" | sudo -E chroot $imagedir debconf-set-selections
+
+# Fix locales
+sudo -E chroot $imagedir apt-get install -y language-pack-en-base
+
+# Install software
+sudo -E chroot $imagedir    \
+  apt-get install -y        \
+    bash-completion \
+    build-essential \
+    coreutils               \
+    curl \
+    curl \
+    dnsutils \
+    ftp \
+    git-core                \
+    heirloom-mailx \
+    iproute2 \
+    iptables \
+    iputils-ping \
+    jwhois \
+    linux-generic \
+    linux-source \
+    less \
+    libssl-dev \
+    libssl-doc \
+    links \
+    man \
+    mutt \
+    nano \
+    netcat-openbsd \
+    net-tools \
+    nmap \
+    openssl \
+    strace \
+    tcpdump \
+    telnet \
+    traceroute \
+    tshark \
+    vim \
+    wget
+
+sudo -E chroot $imagedir sudo -i <<EOF
+  rm -rf ~/.vim ~/.vimrc
+  git clone https://github.com/jeffshantz/vimconfig.git ~/.vim
+  git clone https://github.com/gmarik/Vundle.vim.git ~/.vim/bundle/Vundle.vim
+  ln -s ~/.vim/vimrc ~/.vimrc
+  sed -i -e 's/nnoremap <Left>/"nnoremap <Left>/' \
+         -e 's/nnoremap <Right>/"nnoremap <Right>/' \
+         -e 's/nnoremap <Up>/"nnoremap <Up>/' \
+         -e 's/nnoremap <Down>/"nnoremap <Down>/'\
+         ~/.vimrc
+  vim +BundleInstall +qall
+EOF
+
+stty sane
+
+sudo -E chroot $imagedir sudo -i <<EOF
+  sed -r -i 's/^\s*colorscheme(.*)/"colorscheme\1/' ~/.vimrc
+  sed -i 's/"colorscheme solarized/colorscheme solarized/' ~/.vimrc
+  cp -r ~/.vim /etc/skel
+  cp /etc/skel/.vim/vimrc /etc/skel/.vimrc
+EOF
+
+sudo -E chroot $imagedir <<EOF
+  # Clear the apt cache
+  sudo apt-get clean
+  
+  # Clean up
+  sudo -i rm -f /root/.bash_history 
+  sudo -i rm -f /root/.viminfo 
+  sudo -i bash -c '>/var/log/lastlog'
+  sudo -i bash -c '>/var/log/wtmp'
+  sudo -i bash -c '>/var/log/btmp'
+
+  addgroup --gid 500 $markeruser
+  addgroup --gid 911 $rescueuser
+
+  adduser                    \
+    --home /home/$markeruser \
+    --uid 500                \
+    --gid 500                \
+    --disabled-password      \
+    --gecos "$brand marker"  \
+    $markeruser
+
+  adduser                    \
+    --home /rescue           \
+    --uid 911                \
+    --gid 911                \
+    --disabled-password      \
+    --gecos "$brand rescue"  \
+    $rescueuser
+
+  mkdir -p /home/${markeruser}/.ssh
+  mkdir -p /${rescueuser}/.ssh
+
+  find /home/${markeruser} -type d -exec chmod 700 {} \;
+  find /home/${markeruser} -type d -exec chown 500:500 {} \;
+
+  find /${rescueuser} -type d -exec chmod 700 {} \;
+  find /${rescueuser} -type d -exec chown 911:911 {} \;
+
+  echo "${markeruser} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${markeruser}
+  chmod 0440 /etc/sudoers.d/${markeruser}
+
+  echo "${rescueuser} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${rescueuser}
+  chmod 0440 /etc/sudoers.d/${rescueuser}
+EOF
+
+sudo install --mode=0600 --owner 500 --group 500 $markerkey $imagedir/home/${markeruser}/.ssh/authorized_keys
+sudo install --mode=0600 --owner 911 --group 911 $rescuekey $imagedir/${rescueuser}/.ssh/authorized_keys
+
+# Prevent student from accidentally deleting /rescue, even as root
+# This allows us to recover their instance for them when they
+# mess up the permissions on their .ssh directory.
+sudo install --mode=0644 --owner root --group root $rescuecfg $imagedir/etc/cloud/cloud.cfg.d/
+
+# Download but don't apply Ubuntu security patches automatically (don't want to mess up CS 3305 kernel)
+cat <<EOF | sudo tee $imagedir/etc/apt/apt.conf.d/10periodic > /dev/null
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "0";
+EOF
+
+#### END cs3305-setup
+
+# Clean up chroot environment
+sudo chroot $imagedir umount /proc
+#sudo chroot $imagedir umount /dev/pts
+sudo rm -f $imagedir/usr/sbin/policy-rc.d
+sudo rm -f $imagedir/run/resolvconf/resolv.conf
+
+## Create and mount temporary EBS volume with file system to hold new AMI image
+volumeid=$(sudo -E aws ec2 create-volume \
+             --availability-zone "$zone" \
+             --size "$size"              \
+             --volume-type gp2           \
+             --output text               \
+             --query 'VolumeId' )
+while sudo -E aws ec2 describe-volumes \
+        --volume-id "$volumeid" \
+        --output text \
+        --query 'Volumes[*].State' |
+      grep -v -q available
+  do sleep 3; done
+instance_id=$(wget -qO- http://169.254.169.254/latest/meta-data/instance-id)
+sudo -E aws ec2 attach-volume   \
+   --device /dev/sdi            \
+   --instance-id "$instance_id" \
+   --volume-id "$volumeid"      \
+   --output text                \
+   --query 'State'
+dev=/dev/xvdi
+while [ ! -e $dev ]
+  do sleep 3; done
+sudo mkfs.ext4 -L cloudimg-rootfs $dev
+ebsimagedir=$imagedir-ebs
+sudo mkdir -p $ebsimagedir
+sudo mount $dev $ebsimagedir
+
+# Copy file system from temporary rootdir to EBS volume
+sudo tar -cSf - -C $imagedir . | sudo tar xvf - -C $ebsimagedir
+sudo umount $imagedir
+sudo umount $ebsimagedir
+sudo -E aws ec2 detach-volume \
+  --volume-id "$volumeid" \
+  --output text \
+  --query 'State'
+while sudo -E aws ec2 describe-volumes \
+        --volume-id "$volumeid" \
+        --output text \
+        --query 'Volumes[*].State' |
+      grep -v -q available
+  do sleep 3; done
+snapshotid=$(sudo -E aws ec2 create-snapshot \
+               --description "$name" \
+               --volume-id "$volumeid" \
+               --output text \
+               --query 'SnapshotId' )
+while sudo -E aws ec2 describe-snapshots \
+        --snapshot-id "$snapshotid" \
+        --output text \
+        --query 'Snapshots[*].State' |
+      grep pending
+  do sleep 10; done
+
+# Register the snapshot as a new AMI
+block_device_mapping=$(cat <<EOF
+[
+  {
+    "DeviceName": "/dev/sda1",
+    "Ebs": {
+      "DeleteOnTermination": true, 
+      "SnapshotId": "$snapshotid",
+      "VolumeSize": $size,
+      "VolumeType": "gp2"
+    }
+  }, {
+    "DeviceName": "$ephemeraldev",
+    "VirtualName": "ephemeral0"
+  }
+]
+EOF
+)
+amiid=$(sudo -E aws ec2 register-image            \
+  --name "$name"                                  \
+  --description "$description"                    \
+  --architecture "$arch"                          \
+  --kernel-id "$akiid"                            \
+  --block-device-mapping "$block_device_mapping"  \
+  --root-device-name "/dev/sda1"                  \
+  --output text                                   \
+  --query 'ImageId'
+)
+
+sudo -E aws ec2 delete-volume \
+  --volume-id "$volumeid" \
+  --output text
+
+cat <<EOF
+AMI: $amiid $codename $region $arch2
+
+ami id:       $amiid
+aki id:       $akiid
+region:       $region ($zone)
+architecture: $arch ($arch2)
+os:           Ubuntu $release $codename
+name:         $name
+description:  $description
+EBS volume:   $volumeid (deleted)
+EBS snapshot: $snapshotid
+git:          $git_version
+gitolite:     $gitolite_version ($gitolite_branch branch)
+
+ami_id=$amiid
+snapshot_id=$snapshotid
+
+Test the new AMI using something like:
+
+  instance_id=\$(aws ec2 run-instances \\
+    --region $region \\
+    --key \$USER \\
+    --instance-type t1.micro \\
+    --image-id $amiid
+    --output text \\
+    --query 'Instances[*].InstanceId' )
+  echo instance_id=\$instance_id
+
+EOF
